@@ -3,68 +3,87 @@
     "groceries",
     "fruits_vegetables",
     "dairy_bakery",
+    "meat_seafood",
     "dining_out",
     "coffee_tea",
     "snacks",
     "delivery_fees",
+    "meal_kit",
     "other"
   ],
   "transport": [
     "fuel",
     "public_transport",
     "cab_ride_hailing",
+    "auto_rickshaw",
     "parking",
     "tolls",
     "vehicle_service",
+    "vehicle_insurance",
+    "vehicle_emi",
     "other"
   ],
   "housing": [
     "rent",
+    "mortgage_emi",
     "maintenance_hoa",
     "property_tax",
     "repairs_service",
     "cleaning",
     "furnishing",
+    "security_deposit",
     "other"
   ],
   "utilities": [
     "electricity",
     "water",
-    "gas",
+    "gas_lpg",
     "internet_broadband",
     "mobile_phone",
     "tv_dth",
+    "landline",
     "other"
   ],
   "health": [
     "medicines",
     "doctor_consultation",
     "diagnostics_labs",
+    "hospital_bills",
+    "dental",
+    "vision_eyecare",
     "insurance_health",
     "fitness_gym",
+    "mental_health",
     "other"
   ],
   "education": [
-    "books",
-    "courses",
-    "online_subscriptions",
+    "school_college_fees",
+    "books_stationery",
+    "online_courses",
+    "coaching_tuition",
     "exam_fees",
-    "workshops",
+    "workshops_seminars",
+    "certifications",
     "other"
   ],
   "family_kids": [
     "school_fees",
     "daycare",
     "toys_games",
-    "clothes",
+    "kids_clothing",
+    "baby_supplies",
     "events_birthdays",
+    "allowance",
     "other"
   ],
   "entertainment": [
     "movies_events",
     "streaming_subscriptions",
     "games_apps",
-    "outing",
+    "concerts_shows",
+    "sports_events",
+    "outing_recreation",
+    "books_magazines",
     "other"
   ],
   "shopping": [
@@ -74,28 +93,43 @@
     "electronics_gadgets",
     "appliances",
     "home_decor",
+    "sports_fitness_gear",
+    "bags_luggage",
     "other"
   ],
   "subscriptions": [
     "saas_tools",
     "cloud_ai",
     "newsletters",
-    "music_video",
+    "music_audio",
+    "video_streaming",
     "storage_backup",
+    "security_vpn",
     "other"
   ],
-  "personal_care": ["salon_spa", "grooming", "cosmetics", "hygiene", "other"],
+  "personal_care": [
+    "salon_spa",
+    "grooming",
+    "cosmetics_skincare",
+    "hygiene_toiletries",
+    "haircare",
+    "other"
+  ],
   "gifts_donations": [
     "gifts_personal",
     "charity_donation",
-    "festivals",
+    "festival_celebration",
+    "wedding_contribution",
+    "religious",
     "other"
   ],
   "finance_fees": [
     "bank_charges",
     "late_fees",
-    "interest",
+    "loan_interest",
+    "credit_card_interest",
     "brokerage",
+    "currency_exchange_fees",
     "other"
   ],
   "business": [
@@ -105,6 +139,8 @@
     "contractor_payments",
     "travel_business",
     "office_supplies",
+    "coworking_space",
+    "professional_services",
     "other"
   ],
   "travel": [
@@ -114,6 +150,8 @@
     "visa_passport",
     "local_transport",
     "food_travel",
+    "travel_insurance",
+    "activities_tours",
     "other"
   ],
   "home": [
@@ -122,18 +160,51 @@
     "kitchenware",
     "small_repairs",
     "pest_control",
+    "garden_balcony",
     "other"
   ],
-  "pet": ["food", "vet", "grooming", "supplies", "other"],
-  "taxes": ["income_tax", "gst", "professional_tax", "filing_fees", "other"],
+  "pet": [
+    "food",
+    "vet_medical",
+    "grooming",
+    "supplies_accessories",
+    "insurance_pet",
+    "boarding_daycare",
+    "other"
+  ],
+  "taxes": [
+    "income_tax",
+    "gst",
+    "professional_tax",
+    "property_tax",
+    "tds",
+    "filing_fees",
+    "other"
+  ],
   "investments": [
     "mutual_funds",
-    "stocks",
+    "stocks_etf",
     "fd_rd",
-    "gold",
+    "gold_silver",
     "crypto",
+    "real_estate",
+    "ppf_nps",
     "brokerage_fees",
     "other"
   ],
-  "misc": ["uncategorized", "rounding", "other"]
+  "insurance": [
+    "life_insurance",
+    "health_insurance",
+    "vehicle_insurance",
+    "home_insurance",
+    "term_plan",
+    "other"
+  ],
+  "remittance": [
+    "family_support",
+    "rent_paid_to_family",
+    "international_transfer",
+    "other"
+  ],
+  "misc": ["uncategorized", "rounding", "cash_withdrawal", "other"]
 }

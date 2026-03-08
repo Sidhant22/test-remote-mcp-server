@@ -1,13 +1,11 @@
 from fastmcp import FastMCP
 import os
-import sqlite3
-import json
-from datetime import date as _date
+import aiosqlite
 
 # Where all the transactions are stored
-DB_PATH = os.path.join(os.path.dirname(__file__), 'examples.db')
+DB_PATH = os.path.join(os.path.dirname(__file__), 'expenses.db')
 
-# File path:
+# Categories file path
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), 'categories.json')
 
 # Creating the instance
@@ -18,10 +16,10 @@ mcp = FastMCP("ExpenseTracker")
 # DB INITIALISATION
 # ---------------------------------------------------------------------------
 
-def init_db():
+async def init_db():
     """Create tables for expenses and income if they don't already exist."""
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute('''
+    async with aiosqlite.connect(DB_PATH) as c:
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 date        TEXT    NOT NULL,
@@ -31,7 +29,7 @@ def init_db():
                 note        TEXT    DEFAULT ''
             )
         ''')
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS income (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 date    TEXT    NOT NULL,
@@ -40,8 +38,7 @@ def init_db():
                 note    TEXT    DEFAULT ''
             )
         ''')
-
-init_db()
+        await c.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +46,13 @@ init_db()
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def add_expense(date: str, amount: float, category: str = '', subcategory: str = '', note: str = '') -> dict:
+async def add_expense(
+    date: str,
+    amount: float,
+    category: str = '',
+    subcategory: str = '',
+    note: str = ''
+) -> dict:
     """
     Add a new expense entry to the database.
 
@@ -66,16 +69,18 @@ def add_expense(date: str, amount: float, category: str = '', subcategory: str =
     """
     if amount <= 0:
         return {"status": "error", "message": "amount must be a positive number"}
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(
             'INSERT INTO expenses (date, category, subcategory, amount, note) VALUES (?, ?, ?, ?, ?)',
             (date, category.lower(), subcategory.lower(), amount, note)
         )
+        await c.commit()
         return {"status": "success", "id": cur.lastrowid}
 
 
 @mcp.tool()
-def edit_expense(
+async def edit_expense(
     id: int,
     date: str = None,
     amount: float = None,
@@ -117,15 +122,16 @@ def edit_expense(
     set_clause = ', '.join(f'{col} = ?' for col in updates)
     values     = list(updates.values()) + [id]
 
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(f'UPDATE expenses SET {set_clause} WHERE id = ?', values)
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(f'UPDATE expenses SET {set_clause} WHERE id = ?', values)
+        await c.commit()
         if cur.rowcount == 0:
             return {"status": "error", "message": f"No expense found with id={id}"}
         return {"status": "success", "rows_updated": cur.rowcount}
 
 
 @mcp.tool()
-def delete_expense(
+async def delete_expense(
     id: int = None,
     start_date: str = None,
     end_date: str = None,
@@ -135,9 +141,9 @@ def delete_expense(
     Delete expense entries by ID, or in bulk across a date range.
 
     Two modes:
-      • Single delete  — provide `id` (ignores date params).
-      • Bulk delete    — provide `start_date` + `end_date`; optionally narrow
-                         by `category` (e.g. delete all 'food' in January).
+      • Single delete — provide `id` (ignores date params).
+      • Bulk delete   — provide `start_date` + `end_date`; optionally narrow
+                        by `category` (e.g. delete all 'food' in January).
 
     Args:
         id:         ID of a specific expense to delete.
@@ -148,31 +154,37 @@ def delete_expense(
     Returns:
         {"status": "success", "rows_deleted": <n>} or an error dict.
     """
-    with sqlite3.connect(DB_PATH) as c:
+    async with aiosqlite.connect(DB_PATH) as c:
         if id is not None:
-            cur = c.execute('DELETE FROM expenses WHERE id = ?', (id,))
+            cur = await c.execute('DELETE FROM expenses WHERE id = ?', (id,))
+            await c.commit()
             if cur.rowcount == 0:
                 return {"status": "error", "message": f"No expense found with id={id}"}
             return {"status": "success", "rows_deleted": cur.rowcount}
 
         if start_date and end_date:
             if category:
-                cur = c.execute(
+                cur = await c.execute(
                     'DELETE FROM expenses WHERE date BETWEEN ? AND ? AND category = ?',
                     (start_date, end_date, category.lower())
                 )
             else:
-                cur = c.execute(
+                cur = await c.execute(
                     'DELETE FROM expenses WHERE date BETWEEN ? AND ?',
                     (start_date, end_date)
                 )
+            await c.commit()
             return {"status": "success", "rows_deleted": cur.rowcount}
 
-        return {"status": "error", "message": "Provide either 'id' or both 'start_date' and 'end_date'"}
+    return {"status": "error", "message": "Provide either 'id' or both 'start_date' and 'end_date'"}
 
 
 @mcp.tool()
-def list_expenses(start_date: str, end_date: str, category: str = None) -> list:
+async def list_expenses(
+    start_date: str,
+    end_date: str,
+    category: str = None
+) -> list:
     """
     Retrieve expense entries within a date range.
 
@@ -184,9 +196,10 @@ def list_expenses(start_date: str, end_date: str, category: str = None) -> list:
     Returns:
         List of expense dicts: {id, date, category, subcategory, amount, note}.
     """
-    with sqlite3.connect(DB_PATH) as c:
+    async with aiosqlite.connect(DB_PATH) as c:
+        c.row_factory = aiosqlite.Row
         if category:
-            cur = c.execute(
+            cur = await c.execute(
                 '''SELECT id, date, category, subcategory, amount, note
                    FROM expenses
                    WHERE date BETWEEN ? AND ? AND category = ?
@@ -194,19 +207,23 @@ def list_expenses(start_date: str, end_date: str, category: str = None) -> list:
                 (start_date, end_date, category.lower())
             )
         else:
-            cur = c.execute(
+            cur = await c.execute(
                 '''SELECT id, date, category, subcategory, amount, note
                    FROM expenses
                    WHERE date BETWEEN ? AND ?
                    ORDER BY date ASC, id ASC''',
                 (start_date, end_date)
             )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 @mcp.tool()
-def summarize_expenses(start_date: str, end_date: str, category: str = None) -> list:
+async def summarize_expenses(
+    start_date: str,
+    end_date: str,
+    category: str = None
+) -> list:
     """
     Summarise total spending by category (and sub-category when a category is
     specified) within an inclusive date range.
@@ -218,11 +235,12 @@ def summarize_expenses(start_date: str, end_date: str, category: str = None) -> 
                     within that category instead of by top-level category.
 
     Returns:
-        List of dicts with grouping key(s) and total_amount.
+        List of dicts with grouping key(s) and total_amount, sorted highest first.
     """
-    with sqlite3.connect(DB_PATH) as c:
+    async with aiosqlite.connect(DB_PATH) as c:
+        c.row_factory = aiosqlite.Row
         if category:
-            cur = c.execute(
+            cur = await c.execute(
                 '''SELECT subcategory, SUM(amount) AS total_amount
                    FROM expenses
                    WHERE date BETWEEN ? AND ? AND category = ?
@@ -231,7 +249,7 @@ def summarize_expenses(start_date: str, end_date: str, category: str = None) -> 
                 (start_date, end_date, category.lower())
             )
         else:
-            cur = c.execute(
+            cur = await c.execute(
                 '''SELECT category, SUM(amount) AS total_amount
                    FROM expenses
                    WHERE date BETWEEN ? AND ?
@@ -239,8 +257,8 @@ def summarize_expenses(start_date: str, end_date: str, category: str = None) -> 
                    ORDER BY total_amount DESC''',
                 (start_date, end_date)
             )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +266,12 @@ def summarize_expenses(start_date: str, end_date: str, category: str = None) -> 
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def add_income(date: str, amount: float, source: str = '', note: str = '') -> dict:
+async def add_income(
+    date: str,
+    amount: float,
+    source: str = '',
+    note: str = ''
+) -> dict:
     """
     Record a credit / income entry.
 
@@ -263,16 +286,18 @@ def add_income(date: str, amount: float, source: str = '', note: str = '') -> di
     """
     if amount <= 0:
         return {"status": "error", "message": "amount must be a positive number"}
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(
             'INSERT INTO income (date, source, amount, note) VALUES (?, ?, ?, ?)',
             (date, source.lower(), amount, note)
         )
+        await c.commit()
         return {"status": "success", "id": cur.lastrowid}
 
 
 @mcp.tool()
-def list_income(start_date: str, end_date: str) -> list:
+async def list_income(start_date: str, end_date: str) -> list:
     """
     Retrieve income entries within a date range.
 
@@ -283,16 +308,17 @@ def list_income(start_date: str, end_date: str) -> list:
     Returns:
         List of income dicts: {id, date, source, amount, note}.
     """
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+    async with aiosqlite.connect(DB_PATH) as c:
+        c.row_factory = aiosqlite.Row
+        cur = await c.execute(
             '''SELECT id, date, source, amount, note
                FROM income
                WHERE date BETWEEN ? AND ?
                ORDER BY date ASC, id ASC''',
             (start_date, end_date)
         )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +326,11 @@ def list_income(start_date: str, end_date: str) -> list:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_budget_summary(start_date: str, end_date: str, budgets: dict) -> dict:
+async def get_budget_summary(
+    start_date: str,
+    end_date: str,
+    budgets: dict
+) -> dict:
     """
     Compare actual spending against a budget for each category in a date range.
 
@@ -309,7 +339,7 @@ def get_budget_summary(start_date: str, end_date: str, budgets: dict) -> dict:
         end_date:   End date (YYYY-MM-DD), inclusive.
         budgets:    A dict mapping category names to their budget limits, e.g.
                     {"food": 5000, "transport": 2000, "entertainment": 1500}.
-                    Any category not mentioned is treated as having no set budget.
+                    Categories not listed are treated as having no set budget.
 
     Returns:
         A dict with:
@@ -317,43 +347,41 @@ def get_budget_summary(start_date: str, end_date: str, budgets: dict) -> dict:
           • "total_income" : total credits recorded in the period
           • "total_spent"  : total expenses in the period
           • "net"          : total_income - total_spent
-          • "by_category"  : list of per-category breakdowns, each containing
-                             {category, spent, budget (if set), variance, status}
-            status is one of: "over_budget", "under_budget", "no_budget"
+          • "by_category"  : list of per-category breakdowns:
+                             {category, spent, budget?, variance?, status}
+            status is one of: "over_budget" | "under_budget" | "no_budget"
     """
-    # --- actual spend per category ---
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(
             '''SELECT category, SUM(amount) AS spent
                FROM expenses
                WHERE date BETWEEN ? AND ?
                GROUP BY category''',
             (start_date, end_date)
         )
-        spend_map = {row[0]: row[1] for row in cur.fetchall()}
+        spend_map = {row[0]: row[1] for row in await cur.fetchall()}
 
-        total_income = c.execute(
+        cur2 = await c.execute(
             'SELECT COALESCE(SUM(amount), 0) FROM income WHERE date BETWEEN ? AND ?',
             (start_date, end_date)
-        ).fetchone()[0]
+        )
+        total_income = (await cur2.fetchone())[0]
 
-    total_spent = sum(spend_map.values())
-
-    # --- merge with budgets ---
+    total_spent    = sum(spend_map.values())
     all_categories = set(spend_map.keys()) | set(budgets.keys())
-    by_category = []
+    by_category    = []
+
     for cat in sorted(all_categories):
         spent  = spend_map.get(cat, 0.0)
         budget = budgets.get(cat)
         if budget is not None:
             variance = budget - spent
-            status   = "over_budget" if variance < 0 else "under_budget"
             by_category.append({
                 "category": cat,
                 "spent":    round(spent, 2),
                 "budget":   round(budget, 2),
                 "variance": round(variance, 2),
-                "status":   status
+                "status":   "over_budget" if variance < 0 else "under_budget"
             })
         else:
             by_category.append({
@@ -363,11 +391,11 @@ def get_budget_summary(start_date: str, end_date: str, budgets: dict) -> dict:
             })
 
     return {
-        "period":        {"start": start_date, "end": end_date},
-        "total_income":  round(total_income, 2),
-        "total_spent":   round(total_spent, 2),
-        "net":           round(total_income - total_spent, 2),
-        "by_category":   by_category
+        "period":       {"start": start_date, "end": end_date},
+        "total_income": round(total_income, 2),
+        "total_spent":  round(total_spent, 2),
+        "net":          round(total_income - total_spent, 2),
+        "by_category":  by_category
     }
 
 
@@ -376,7 +404,7 @@ def get_budget_summary(start_date: str, end_date: str, budgets: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.resource("expense://categories", mime_type="application/json")
-def categories():
+def categories() -> str:
     """Return the full categories taxonomy. Read fresh each call so file edits
     take effect without restarting the server."""
     with open(CATEGORIES_PATH, 'r', encoding='utf-8') as f:
@@ -386,8 +414,11 @@ def categories():
 # ---------------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------------
-# Start the server:
+
 if __name__ == "__main__":
-    # Here is a subtle difference that we see when using a remote mcp server over local mcp server
-    # When we just specify: mcp.run(): Then FastMCP assumes the transport: stdio
-    mcp.run(transport="http", host="0.0.0.0", port= 8080)
+    import asyncio
+    # Initialise DB tables before the server starts accepting requests
+    asyncio.run(init_db())
+    # transport="http" puts FastMCP into streamable-HTTP (remote) mode.
+    # host="0.0.0.0" makes the server reachable outside the container/VM.
+    mcp.run(transport="http", host="0.0.0.0", port=8080)
