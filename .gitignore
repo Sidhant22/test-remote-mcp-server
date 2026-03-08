@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# dtatabase files:
+*.db
+*.sqlite
+*.sqlite3
