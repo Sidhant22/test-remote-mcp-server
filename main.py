@@ -1,27 +1,31 @@
 from fastmcp import FastMCP
 import os
-# For synchronous handling of tasks
-import aiosqlite
+import sqlite3    # sync — only used for init_db()
+import aiosqlite  # async — used for all tool handlers
 
-# Where all the transactions are stored
-# DB_PATH = os.path.join(os.path.dirname(__file__), 'expenses.db')
-DB_PATH = os.environ.get("DB_PATH", "/tmp/expenses.db")
+# ---------------------------------------------------------------------------
+# PATHS
+# ---------------------------------------------------------------------------
 
-# Categories file path
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), 'categories.json')
+# /tmp is always writable on cloud runtimes; override via DB_PATH env var
+# if a persistent volume is available.
+DB_PATH        = os.environ.get("DB_PATH", "/tmp/expenses.db")
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 # Creating the instance
 mcp = FastMCP("ExpenseTracker")
 
 
 # ---------------------------------------------------------------------------
-# DB INITIALISATION
+# DB INITIALISATION  — sync, runs at module load so it works whether the
+# platform calls  `python main.py`  OR imports the module directly.
 # ---------------------------------------------------------------------------
 
-async def init_db():
+def init_db():
     """Create tables for expenses and income if they don't already exist."""
-    async with aiosqlite.connect(DB_PATH) as c:
-        await c.execute('''
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("PRAGMA journal_mode=WAL")   # safer for concurrent access
+        c.execute('''
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 date        TEXT    NOT NULL,
@@ -31,7 +35,7 @@ async def init_db():
                 note        TEXT    DEFAULT ''
             )
         ''')
-        await c.execute('''
+        c.execute('''
             CREATE TABLE IF NOT EXISTS income (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 date    TEXT    NOT NULL,
@@ -40,7 +44,10 @@ async def init_db():
                 note    TEXT    DEFAULT ''
             )
         ''')
-        await c.commit()
+        c.commit()
+
+# Run immediately on import — guaranteed to execute regardless of entry point
+init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -418,9 +425,6 @@ def categories() -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import asyncio
-    # Initialise DB tables before the server starts accepting requests
-    asyncio.run(init_db())
     # transport="http" puts FastMCP into streamable-HTTP (remote) mode.
     # host="0.0.0.0" makes the server reachable outside the container/VM.
     mcp.run(transport="http", host="0.0.0.0", port=8080)
