@@ -1,5 +1,6 @@
 from fastmcp import FastMCP
 import os
+# For synchronous handling of tasks
 import aiosqlite
 
 # Where all the transactions are stored
