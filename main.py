@@ -4,7 +4,8 @@ import os
 import aiosqlite
 
 # Where all the transactions are stored
-DB_PATH = os.path.join(os.path.dirname(__file__), 'expenses.db')
+# DB_PATH = os.path.join(os.path.dirname(__file__), 'expenses.db')
+DB_PATH = os.environ.get("DB_PATH", "/tmp/expenses.db")
 
 # Categories file path
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), 'categories.json')
