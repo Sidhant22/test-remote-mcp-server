@@ -1,11 +1,10 @@
 # main.py
 from fastmcp import FastMCP
-from fastmcp.server.auth import get_access_token   # reads token from request context
+from fastmcp.server.auth.providers.github import GitHubProvider  # built-in in FastMCP 3.x
+from fastmcp.server.dependencies import get_access_token          # correct 3.x import path
 import os
 import sqlite3
 import aiosqlite
-
-from auth import GitHubOAuthProvider
 
 # ---------------------------------------------------------------------------
 # PATHS & CONFIG
@@ -15,13 +14,22 @@ DB_PATH         = os.environ.get("DB_PATH", "/tmp/expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 # ---------------------------------------------------------------------------
-# MCP INSTANCE — attach the OAuth provider here
+# AUTH — GitHubProvider handles the entire OAuth dance automatically.
+# It redirects users to GitHub login, exchanges the code for a token,
+# validates the token on every request, and populates token.claims with
+# the authenticated user's GitHub profile data.
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    "ExpenseTracker",
-    auth=GitHubOAuthProvider(),   # <— this one line enables auth on all tools
+auth_provider = GitHubProvider(
+    client_id     = os.environ["GITHUB_CLIENT_ID"],
+    client_secret = os.environ["GITHUB_CLIENT_SECRET"],
+    base_url      = os.environ["SERVER_BASE_URL"],   # e.g. https://accessible-tomato-meerkat.fastmcp.app
+    # JWT_SECRET is used internally by GitHubProvider to sign session tokens.
+    # Pass it via jwt_signing_key so sessions survive server restarts.
+    jwt_signing_key = os.environ["JWT_SECRET"],
 )
+
+mcp = FastMCP("ExpenseTracker", auth=auth_provider)
 
 
 # ---------------------------------------------------------------------------
@@ -30,21 +38,21 @@ mcp = FastMCP(
 
 def get_current_user_id() -> str:
     """
-    Extract the authenticated user's GitHub ID from the request context.
+    Returns the authenticated user's GitHub numeric ID as a string.
 
-    FastMCP stores the validated JWT payload (returned by
-    GitHubOAuthProvider.validate_token) in the current async context.
-    get_access_token() retrieves it — no need to pass it through every
-    function argument manually.
+    GitHubProvider stores the full GitHub user profile in token.claims after
+    a successful login. The 'id' claim is the stable numeric GitHub user ID —
+    safe to use as a database key because it never changes even if the user
+    renames their account.
 
-    Returns the GitHub numeric ID as a string, e.g. "8675309".
-    Raises if called outside an authenticated request (shouldn't happen
-    once auth is wired up, but good to be explicit).
+    token.claims keys available: id, login, name, email, avatar_url, company,
+    location, bio, public_repos, followers, following.
     """
-    token_data = get_access_token()
-    if token_data is None:
+    token = get_access_token()
+    if token is None:
         raise RuntimeError("No authenticated user in current request context")
-    return token_data["sub"]   # "sub" = GitHub numeric user ID, set in create_jwt()
+    # GitHub numeric user ID — stable, unique, never changes
+    return str(token.claims.get("id") or token.client_id)
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +60,7 @@ def get_current_user_id() -> str:
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """
-    Create tables. Note the user_id column on both tables — this is what
-    makes multi-user isolation possible. Every row is owned by one user.
-    """
+    """Create tables with user_id column for multi-user isolation."""
     with sqlite3.connect(DB_PATH) as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute('''
@@ -79,7 +84,6 @@ def init_db():
                 note    TEXT    DEFAULT ''
             )
         ''')
-        # Index makes WHERE user_id = ? queries fast as the table grows
         c.execute('CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_income_user   ON income(user_id)')
         c.commit()
@@ -89,8 +93,6 @@ init_db()
 
 # ---------------------------------------------------------------------------
 # EXPENSE TOOLS
-# The only change vs. the previous version: every query now includes
-# user_id so each user sees only their own data.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -115,7 +117,6 @@ async def add_expense(
         return {"status": "error", "message": "amount must be a positive number"}
 
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
             '''INSERT INTO expenses (user_id, date, category, subcategory, amount, note)
@@ -136,7 +137,7 @@ async def edit_expense(
     note: str = None
 ) -> dict:
     """
-    Update one or more fields of an existing expense entry.
+    Update one or more fields of an existing expense.
     Only edits expenses that belong to the authenticated user.
 
     Args:
@@ -165,10 +166,8 @@ async def edit_expense(
     values     = list(updates.values()) + [id, user_id]
 
     async with aiosqlite.connect(DB_PATH) as c:
-        # WHERE id = ? AND user_id = ? prevents editing another user's expense
         cur = await c.execute(
-            f'UPDATE expenses SET {set_clause} WHERE id = ? AND user_id = ?',
-            values
+            f'UPDATE expenses SET {set_clause} WHERE id = ? AND user_id = ?', values
         )
         await c.commit()
         if cur.rowcount == 0:
@@ -195,8 +194,7 @@ async def delete_expense(
     async with aiosqlite.connect(DB_PATH) as c:
         if id is not None:
             cur = await c.execute(
-                'DELETE FROM expenses WHERE id = ? AND user_id = ?',
-                (id, user_id)
+                'DELETE FROM expenses WHERE id = ? AND user_id = ?', (id, user_id)
             )
             await c.commit()
             if cur.rowcount == 0:
@@ -206,8 +204,7 @@ async def delete_expense(
         if start_date and end_date:
             if category:
                 cur = await c.execute(
-                    '''DELETE FROM expenses
-                       WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?''',
+                    'DELETE FROM expenses WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?',
                     (start_date, end_date, category.lower(), user_id)
                 )
             else:
@@ -236,7 +233,6 @@ async def list_expenses(
         category:   Optional category filter.
     """
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         if category:
@@ -255,8 +251,7 @@ async def list_expenses(
                    ORDER BY date ASC, id ASC''',
                 (start_date, end_date, user_id)
             )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
 
 @mcp.tool()
@@ -271,10 +266,9 @@ async def summarize_expenses(
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
         end_date:   End date (YYYY-MM-DD), inclusive.
-        category:   Optional — drill down into subcategories of this category.
+        category:   Optional — drill into subcategories of this category.
     """
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         if category:
@@ -282,8 +276,7 @@ async def summarize_expenses(
                 '''SELECT subcategory, SUM(amount) AS total_amount
                    FROM expenses
                    WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?
-                   GROUP BY subcategory
-                   ORDER BY total_amount DESC''',
+                   GROUP BY subcategory ORDER BY total_amount DESC''',
                 (start_date, end_date, category.lower(), user_id)
             )
         else:
@@ -291,12 +284,10 @@ async def summarize_expenses(
                 '''SELECT category, SUM(amount) AS total_amount
                    FROM expenses
                    WHERE date BETWEEN ? AND ? AND user_id = ?
-                   GROUP BY category
-                   ORDER BY total_amount DESC''',
+                   GROUP BY category ORDER BY total_amount DESC''',
                 (start_date, end_date, user_id)
             )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +305,7 @@ async def add_income(
     Record a credit / income entry for the authenticated user.
 
     Args:
-        date:   Date of the income in YYYY-MM-DD format.
+        date:   Date in YYYY-MM-DD format.
         amount: Income amount (positive number).
         source: Where the money came from (e.g. 'salary', 'freelance').
         note:   Optional free-text description.
@@ -323,7 +314,6 @@ async def add_income(
         return {"status": "error", "message": "amount must be a positive number"}
 
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
             'INSERT INTO income (user_id, date, source, amount, note) VALUES (?, ?, ?, ?, ?)',
@@ -343,7 +333,6 @@ async def list_income(start_date: str, end_date: str) -> list:
         end_date:   End date (YYYY-MM-DD), inclusive.
     """
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         cur = await c.execute(
@@ -353,8 +342,7 @@ async def list_income(start_date: str, end_date: str) -> list:
                ORDER BY date ASC, id ASC''',
             (start_date, end_date, user_id)
         )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -376,12 +364,10 @@ async def get_budget_summary(
         budgets:    Dict of category → limit, e.g. {"food": 5000, "transport": 2000}.
     """
     user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
             '''SELECT category, SUM(amount) AS spent
-               FROM expenses
-               WHERE date BETWEEN ? AND ? AND user_id = ?
+               FROM expenses WHERE date BETWEEN ? AND ? AND user_id = ?
                GROUP BY category''',
             (start_date, end_date, user_id)
         )
