@@ -1,67 +1,33 @@
-# main.py
 from fastmcp import FastMCP
-from fastmcp.server.auth import get_access_token   # reads token from request context
 import os
-import sqlite3
-import aiosqlite
-
-from auth import GitHubOAuthProvider
+import sqlite3    # sync — only used for init_db()
+import aiosqlite  # async — used for all tool handlers
 
 # ---------------------------------------------------------------------------
-# PATHS & CONFIG
+# PATHS
 # ---------------------------------------------------------------------------
 
-DB_PATH         = os.environ.get("DB_PATH", "/tmp/expenses.db")
+# /tmp is always writable on cloud runtimes; override via DB_PATH env var
+# if a persistent volume is available.
+DB_PATH        = os.environ.get("DB_PATH", "/tmp/expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-# ---------------------------------------------------------------------------
-# MCP INSTANCE — attach the OAuth provider here
-# ---------------------------------------------------------------------------
-
-mcp = FastMCP(
-    "ExpenseTracker",
-    auth=GitHubOAuthProvider(),   # <— this one line enables auth on all tools
-)
+# Creating the instance
+mcp = FastMCP("ExpenseTracker")
 
 
 # ---------------------------------------------------------------------------
-# IDENTITY HELPER
-# ---------------------------------------------------------------------------
-
-def get_current_user_id() -> str:
-    """
-    Extract the authenticated user's GitHub ID from the request context.
-
-    FastMCP stores the validated JWT payload (returned by
-    GitHubOAuthProvider.validate_token) in the current async context.
-    get_access_token() retrieves it — no need to pass it through every
-    function argument manually.
-
-    Returns the GitHub numeric ID as a string, e.g. "8675309".
-    Raises if called outside an authenticated request (shouldn't happen
-    once auth is wired up, but good to be explicit).
-    """
-    token_data = get_access_token()
-    if token_data is None:
-        raise RuntimeError("No authenticated user in current request context")
-    return token_data["sub"]   # "sub" = GitHub numeric user ID, set in create_jwt()
-
-
-# ---------------------------------------------------------------------------
-# DB INITIALISATION  — sync, runs at module load
+# DB INITIALISATION  — sync, runs at module load so it works whether the
+# platform calls  `python main.py`  OR imports the module directly.
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """
-    Create tables. Note the user_id column on both tables — this is what
-    makes multi-user isolation possible. Every row is owned by one user.
-    """
+    """Create tables for expenses and income if they don't already exist."""
     with sqlite3.connect(DB_PATH) as c:
-        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA journal_mode=WAL")   # safer for concurrent access
         c.execute('''
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     TEXT    NOT NULL,
                 date        TEXT    NOT NULL,
                 category    TEXT    DEFAULT '',
                 subcategory TEXT    DEFAULT '',
@@ -72,25 +38,20 @@ def init_db():
         c.execute('''
             CREATE TABLE IF NOT EXISTS income (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT    NOT NULL,
                 date    TEXT    NOT NULL,
                 source  TEXT    DEFAULT '',
                 amount  REAL    NOT NULL,
                 note    TEXT    DEFAULT ''
             )
         ''')
-        # Index makes WHERE user_id = ? queries fast as the table grows
-        c.execute('CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_income_user   ON income(user_id)')
         c.commit()
 
+# Run immediately on import — guaranteed to execute regardless of entry point
 init_db()
 
 
 # ---------------------------------------------------------------------------
 # EXPENSE TOOLS
-# The only change vs. the previous version: every query now includes
-# user_id so each user sees only their own data.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -107,20 +68,21 @@ async def add_expense(
     Args:
         date:        Date of the expense in YYYY-MM-DD format.
         amount:      Expense amount (positive number).
-        category:    Top-level category (e.g. 'food', 'transport').
-        subcategory: Sub-category within the chosen category.
+        category:    Top-level category (e.g. 'food', 'transport'). See the
+                     expense://categories resource for valid values.
+        subcategory: Sub-category within the chosen category (e.g. 'groceries').
         note:        Optional free-text description.
+
+    Returns:
+        {"status": "success", "id": <new row id>}
     """
     if amount <= 0:
         return {"status": "error", "message": "amount must be a positive number"}
 
-    user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
-            '''INSERT INTO expenses (user_id, date, category, subcategory, amount, note)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (user_id, date, category.lower(), subcategory.lower(), amount, note)
+            'INSERT INTO expenses (date, category, subcategory, amount, note) VALUES (?, ?, ?, ?, ?)',
+            (date, category.lower(), subcategory.lower(), amount, note)
         )
         await c.commit()
         return {"status": "success", "id": cur.lastrowid}
@@ -137,15 +99,21 @@ async def edit_expense(
 ) -> dict:
     """
     Update one or more fields of an existing expense entry.
-    Only edits expenses that belong to the authenticated user.
+
+    Supply only the fields you want to change — unchanged fields keep their
+    current values.
 
     Args:
-        id:          ID of the expense to edit.
-        date:        New date (optional).
+        id:          The numeric ID of the expense to edit (returned by add_expense
+                     or visible in list_expenses).
+        date:        New date in YYYY-MM-DD format (optional).
         amount:      New amount (optional, must be positive).
         category:    New top-level category (optional).
         subcategory: New sub-category (optional).
         note:        New note text (optional).
+
+    Returns:
+        {"status": "success", "rows_updated": 1} or an error dict.
     """
     updates = {}
     if date        is not None: updates['date']        = date
@@ -160,16 +128,11 @@ async def edit_expense(
     if not updates:
         return {"status": "error", "message": "No fields provided to update"}
 
-    user_id    = get_current_user_id()
     set_clause = ', '.join(f'{col} = ?' for col in updates)
-    values     = list(updates.values()) + [id, user_id]
+    values     = list(updates.values()) + [id]
 
     async with aiosqlite.connect(DB_PATH) as c:
-        # WHERE id = ? AND user_id = ? prevents editing another user's expense
-        cur = await c.execute(
-            f'UPDATE expenses SET {set_clause} WHERE id = ? AND user_id = ?',
-            values
-        )
+        cur = await c.execute(f'UPDATE expenses SET {set_clause} WHERE id = ?', values)
         await c.commit()
         if cur.rowcount == 0:
             return {"status": "error", "message": f"No expense found with id={id}"}
@@ -184,20 +147,25 @@ async def delete_expense(
     category: str = None
 ) -> dict:
     """
-    Delete expense entries. Only deletes expenses owned by the authenticated user.
+    Delete expense entries by ID, or in bulk across a date range.
 
     Two modes:
-      • Single delete — provide id.
-      • Bulk delete   — provide start_date + end_date, optional category filter.
-    """
-    user_id = get_current_user_id()
+      • Single delete — provide `id` (ignores date params).
+      • Bulk delete   — provide `start_date` + `end_date`; optionally narrow
+                        by `category` (e.g. delete all 'food' in January).
 
+    Args:
+        id:         ID of a specific expense to delete.
+        start_date: Start of date range (YYYY-MM-DD), inclusive.
+        end_date:   End of date range (YYYY-MM-DD), inclusive.
+        category:   Optional category filter for bulk deletes.
+
+    Returns:
+        {"status": "success", "rows_deleted": <n>} or an error dict.
+    """
     async with aiosqlite.connect(DB_PATH) as c:
         if id is not None:
-            cur = await c.execute(
-                'DELETE FROM expenses WHERE id = ? AND user_id = ?',
-                (id, user_id)
-            )
+            cur = await c.execute('DELETE FROM expenses WHERE id = ?', (id,))
             await c.commit()
             if cur.rowcount == 0:
                 return {"status": "error", "message": f"No expense found with id={id}"}
@@ -206,14 +174,13 @@ async def delete_expense(
         if start_date and end_date:
             if category:
                 cur = await c.execute(
-                    '''DELETE FROM expenses
-                       WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?''',
-                    (start_date, end_date, category.lower(), user_id)
+                    'DELETE FROM expenses WHERE date BETWEEN ? AND ? AND category = ?',
+                    (start_date, end_date, category.lower())
                 )
             else:
                 cur = await c.execute(
-                    'DELETE FROM expenses WHERE date BETWEEN ? AND ? AND user_id = ?',
-                    (start_date, end_date, user_id)
+                    'DELETE FROM expenses WHERE date BETWEEN ? AND ?',
+                    (start_date, end_date)
                 )
             await c.commit()
             return {"status": "success", "rows_deleted": cur.rowcount}
@@ -228,32 +195,33 @@ async def list_expenses(
     category: str = None
 ) -> list:
     """
-    Retrieve the authenticated user's expenses within a date range.
+    Retrieve expense entries within a date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
         end_date:   End date (YYYY-MM-DD), inclusive.
-        category:   Optional category filter.
-    """
-    user_id = get_current_user_id()
+        category:   Optional — filter results to a single top-level category.
 
+    Returns:
+        List of expense dicts: {id, date, category, subcategory, amount, note}.
+    """
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         if category:
             cur = await c.execute(
                 '''SELECT id, date, category, subcategory, amount, note
                    FROM expenses
-                   WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?
+                   WHERE date BETWEEN ? AND ? AND category = ?
                    ORDER BY date ASC, id ASC''',
-                (start_date, end_date, category.lower(), user_id)
+                (start_date, end_date, category.lower())
             )
         else:
             cur = await c.execute(
                 '''SELECT id, date, category, subcategory, amount, note
                    FROM expenses
-                   WHERE date BETWEEN ? AND ? AND user_id = ?
+                   WHERE date BETWEEN ? AND ?
                    ORDER BY date ASC, id ASC''',
-                (start_date, end_date, user_id)
+                (start_date, end_date)
             )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -266,41 +234,44 @@ async def summarize_expenses(
     category: str = None
 ) -> list:
     """
-    Summarise the authenticated user's spending by category (or subcategory).
+    Summarise total spending by category (and sub-category when a category is
+    specified) within an inclusive date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
         end_date:   End date (YYYY-MM-DD), inclusive.
-        category:   Optional — drill down into subcategories of this category.
-    """
-    user_id = get_current_user_id()
+        category:   Optional — when provided, breaks down totals by subcategory
+                    within that category instead of by top-level category.
 
+    Returns:
+        List of dicts with grouping key(s) and total_amount, sorted highest first.
+    """
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         if category:
             cur = await c.execute(
                 '''SELECT subcategory, SUM(amount) AS total_amount
                    FROM expenses
-                   WHERE date BETWEEN ? AND ? AND category = ? AND user_id = ?
+                   WHERE date BETWEEN ? AND ? AND category = ?
                    GROUP BY subcategory
                    ORDER BY total_amount DESC''',
-                (start_date, end_date, category.lower(), user_id)
+                (start_date, end_date, category.lower())
             )
         else:
             cur = await c.execute(
                 '''SELECT category, SUM(amount) AS total_amount
                    FROM expenses
-                   WHERE date BETWEEN ? AND ? AND user_id = ?
+                   WHERE date BETWEEN ? AND ?
                    GROUP BY category
                    ORDER BY total_amount DESC''',
-                (start_date, end_date, user_id)
+                (start_date, end_date)
             )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
-# INCOME TOOLS
+# INCOME / CREDIT TOOLS
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -311,23 +282,24 @@ async def add_income(
     note: str = ''
 ) -> dict:
     """
-    Record a credit / income entry for the authenticated user.
+    Record a credit / income entry.
 
     Args:
         date:   Date of the income in YYYY-MM-DD format.
         amount: Income amount (positive number).
-        source: Where the money came from (e.g. 'salary', 'freelance').
+        source: Where the money came from (e.g. 'salary', 'freelance', 'dividends').
         note:   Optional free-text description.
+
+    Returns:
+        {"status": "success", "id": <new row id>}
     """
     if amount <= 0:
         return {"status": "error", "message": "amount must be a positive number"}
 
-    user_id = get_current_user_id()
-
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
-            'INSERT INTO income (user_id, date, source, amount, note) VALUES (?, ?, ?, ?, ?)',
-            (user_id, date, source.lower(), amount, note)
+            'INSERT INTO income (date, source, amount, note) VALUES (?, ?, ?, ?)',
+            (date, source.lower(), amount, note)
         )
         await c.commit()
         return {"status": "success", "id": cur.lastrowid}
@@ -336,22 +308,23 @@ async def add_income(
 @mcp.tool()
 async def list_income(start_date: str, end_date: str) -> list:
     """
-    Retrieve the authenticated user's income entries within a date range.
+    Retrieve income entries within a date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
         end_date:   End date (YYYY-MM-DD), inclusive.
-    """
-    user_id = get_current_user_id()
 
+    Returns:
+        List of income dicts: {id, date, source, amount, note}.
+    """
     async with aiosqlite.connect(DB_PATH) as c:
         c.row_factory = aiosqlite.Row
         cur = await c.execute(
             '''SELECT id, date, source, amount, note
                FROM income
-               WHERE date BETWEEN ? AND ? AND user_id = ?
+               WHERE date BETWEEN ? AND ?
                ORDER BY date ASC, id ASC''',
-            (start_date, end_date, user_id)
+            (start_date, end_date)
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -368,28 +341,38 @@ async def get_budget_summary(
     budgets: dict
 ) -> dict:
     """
-    Compare the authenticated user's actual spending against a budget.
+    Compare actual spending against a budget for each category in a date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
         end_date:   End date (YYYY-MM-DD), inclusive.
-        budgets:    Dict of category → limit, e.g. {"food": 5000, "transport": 2000}.
-    """
-    user_id = get_current_user_id()
+        budgets:    A dict mapping category names to their budget limits, e.g.
+                    {"food": 5000, "transport": 2000, "entertainment": 1500}.
+                    Categories not listed are treated as having no set budget.
 
+    Returns:
+        A dict with:
+          • "period"       : {"start": ..., "end": ...}
+          • "total_income" : total credits recorded in the period
+          • "total_spent"  : total expenses in the period
+          • "net"          : total_income - total_spent
+          • "by_category"  : list of per-category breakdowns:
+                             {category, spent, budget?, variance?, status}
+            status is one of: "over_budget" | "under_budget" | "no_budget"
+    """
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
             '''SELECT category, SUM(amount) AS spent
                FROM expenses
-               WHERE date BETWEEN ? AND ? AND user_id = ?
+               WHERE date BETWEEN ? AND ?
                GROUP BY category''',
-            (start_date, end_date, user_id)
+            (start_date, end_date)
         )
         spend_map = {row[0]: row[1] for row in await cur.fetchall()}
 
         cur2 = await c.execute(
-            'SELECT COALESCE(SUM(amount), 0) FROM income WHERE date BETWEEN ? AND ? AND user_id = ?',
-            (start_date, end_date, user_id)
+            'SELECT COALESCE(SUM(amount), 0) FROM income WHERE date BETWEEN ? AND ?',
+            (start_date, end_date)
         )
         total_income = (await cur2.fetchone())[0]
 
@@ -431,7 +414,8 @@ async def get_budget_summary(
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories() -> str:
-    """Return the full categories taxonomy."""
+    """Return the full categories taxonomy. Read fresh each call so file edits
+    take effect without restarting the server."""
     with open(CATEGORIES_PATH, 'r', encoding='utf-8') as f:
         return f.read()
 
@@ -441,4 +425,6 @@ def categories() -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # transport="http" puts FastMCP into streamable-HTTP (remote) mode.
+    # host="0.0.0.0" makes the server reachable outside the container/VM.
     mcp.run(transport="http", host="0.0.0.0", port=8080)
