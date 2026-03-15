@@ -1,10 +1,18 @@
 # main.py
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.github import GitHubProvider  # built-in in FastMCP 3.x
-from fastmcp.server.dependencies import get_access_token          # correct 3.x import path
+from fastmcp.server.auth.providers.github import GitHubProvider
+from fastmcp.server.dependencies import get_access_token
 import os
 import sqlite3
 import aiosqlite
+import logging
+
+# ---------------------------------------------------------------------------
+# LOGGING — visible in Horizon's Logs tab
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("expense_tracker")
 
 # ---------------------------------------------------------------------------
 # PATHS & CONFIG
@@ -14,18 +22,13 @@ DB_PATH         = os.environ.get("DB_PATH", "/tmp/expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 # ---------------------------------------------------------------------------
-# AUTH — GitHubProvider handles the entire OAuth dance automatically.
-# It redirects users to GitHub login, exchanges the code for a token,
-# validates the token on every request, and populates token.claims with
-# the authenticated user's GitHub profile data.
+# AUTH
 # ---------------------------------------------------------------------------
 
 auth_provider = GitHubProvider(
-    client_id     = os.environ["GITHUB_CLIENT_ID"],
-    client_secret = os.environ["GITHUB_CLIENT_SECRET"],
-    base_url      = os.environ["SERVER_BASE_URL"],   # e.g. https://accessible-tomato-meerkat.fastmcp.app
-    # JWT_SECRET is used internally by GitHubProvider to sign session tokens.
-    # Pass it via jwt_signing_key so sessions survive server restarts.
+    client_id       = os.environ["GITHUB_CLIENT_ID"],
+    client_secret   = os.environ["GITHUB_CLIENT_SECRET"],
+    base_url        = os.environ["SERVER_BASE_URL"],
     jwt_signing_key = os.environ["JWT_SECRET"],
 )
 
@@ -38,21 +41,43 @@ mcp = FastMCP("ExpenseTracker", auth=auth_provider)
 
 def get_current_user_id() -> str:
     """
-    Returns the authenticated user's GitHub numeric ID as a string.
+    Returns a stable user identifier from the current OAuth token.
 
-    GitHubProvider stores the full GitHub user profile in token.claims after
-    a successful login. The 'id' claim is the stable numeric GitHub user ID —
-    safe to use as a database key because it never changes even if the user
-    renames their account.
+    Tries multiple fields in order of preference:
+      1. token.claims["id"]    — GitHub numeric user ID (most stable)
+      2. token.claims["login"] — GitHub username (fallback)
+      3. token.client_id       — OAuth client ID (last resort)
 
-    token.claims keys available: id, login, name, email, avatar_url, company,
-    location, bio, public_repos, followers, following.
+    Logs the full claims dict at INFO level so you can see exactly what
+    GitHubProvider is putting in the token — useful during debugging.
     """
     token = get_access_token()
+
     if token is None:
-        raise RuntimeError("No authenticated user in current request context")
-    # GitHub numeric user ID — stable, unique, never changes
-    return str(token.claims.get("id") or token.client_id)
+        # This should not happen when GitHubProvider is configured, but
+        # log it clearly if it does rather than crashing with a cryptic error.
+        log.error("get_access_token() returned None — no auth context in this request")
+        raise RuntimeError(
+            "No authenticated user found. "
+            "Make sure you are connected via OAuth before calling tools."
+        )
+
+    # Log what's available so we can see it in Horizon Logs
+    log.info(f"Token client_id: {token.client_id}")
+    log.info(f"Token claims: {token.claims}")
+
+    # Try each field in order
+    user_id = (
+        token.claims.get("id")       # GitHub numeric ID  e.g. 8675309
+        or token.claims.get("login") # GitHub username    e.g. "Sidhant22"
+        or token.client_id           # OAuth client ID
+    )
+
+    if not user_id:
+        log.error(f"Could not extract user_id from token. claims={token.claims}")
+        raise RuntimeError("Could not determine user identity from token.")
+
+    return str(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +85,6 @@ def get_current_user_id() -> str:
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """Create tables with user_id column for multi-user isolation."""
     with sqlite3.connect(DB_PATH) as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute('''
@@ -117,6 +141,8 @@ async def add_expense(
         return {"status": "error", "message": "amount must be a positive number"}
 
     user_id = get_current_user_id()
+    log.info(f"add_expense called by user_id={user_id} date={date} amount={amount}")
+
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
             '''INSERT INTO expenses (user_id, date, category, subcategory, amount, note)
@@ -124,6 +150,7 @@ async def add_expense(
             (user_id, date, category.lower(), subcategory.lower(), amount, note)
         )
         await c.commit()
+        log.info(f"Expense inserted with id={cur.lastrowid}")
         return {"status": "success", "id": cur.lastrowid}
 
 
