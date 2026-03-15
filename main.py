@@ -1,38 +1,41 @@
 # main.py
+#
+# ARCHITECTURE NOTE:
+# On Horizon, your server runs privately on port 8081 behind a gateway on 8080.
+# The gateway handles ALL authentication — your server must NOT configure any
+# auth provider. Adding GitHubProvider here causes a 401 because the gateway
+# calls your server internally without forwarding the user's token.
+#
+# For multi-user data isolation, Horizon injects user identity via HTTP headers.
+# We log all incoming headers on the first tool call so you can see exactly
+# which header to use as your user_id key.
+
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.github import GitHubProvider
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_http_headers
 import os
 import sqlite3
 import aiosqlite
 import logging
 
 # ---------------------------------------------------------------------------
-# LOGGING — visible in Horizon's Logs tab
+# LOGGING
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("expense_tracker")
 
 # ---------------------------------------------------------------------------
-# PATHS & CONFIG
+# PATHS
 # ---------------------------------------------------------------------------
 
 DB_PATH         = os.environ.get("DB_PATH", "/tmp/expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 # ---------------------------------------------------------------------------
-# AUTH
+# MCP INSTANCE — no auth= parameter, Horizon gateway handles it
 # ---------------------------------------------------------------------------
 
-auth_provider = GitHubProvider(
-    client_id       = os.environ["GITHUB_CLIENT_ID"],
-    client_secret   = os.environ["GITHUB_CLIENT_SECRET"],
-    base_url        = os.environ["SERVER_BASE_URL"],
-    jwt_signing_key = os.environ["JWT_SECRET"],
-)
-
-mcp = FastMCP("ExpenseTracker", auth=auth_provider)
+mcp = FastMCP("ExpenseTracker")
 
 
 # ---------------------------------------------------------------------------
@@ -41,47 +44,40 @@ mcp = FastMCP("ExpenseTracker", auth=auth_provider)
 
 def get_current_user_id() -> str:
     """
-    Returns a stable user identifier from the current OAuth token.
+    Extract a stable user identifier from headers injected by Horizon's gateway.
 
-    Tries multiple fields in order of preference:
-      1. token.claims["id"]    — GitHub numeric user ID (most stable)
-      2. token.claims["login"] — GitHub username (fallback)
-      3. token.client_id       — OAuth client ID (last resort)
+    On first call, logs ALL headers so you can see what Horizon provides.
+    Common candidates: x-user-id, x-forwarded-user, x-auth-user, authorization.
 
-    Logs the full claims dict at INFO level so you can see exactly what
-    GitHubProvider is putting in the token — useful during debugging.
+    Falls back to "anonymous" if no identity header is found, so the server
+    keeps working while we identify the correct header name.
     """
-    token = get_access_token()
+    headers = get_http_headers()
 
-    if token is None:
-        # This should not happen when GitHubProvider is configured, but
-        # log it clearly if it does rather than crashing with a cryptic error.
-        log.error("get_access_token() returned None — no auth context in this request")
-        raise RuntimeError(
-            "No authenticated user found. "
-            "Make sure you are connected via OAuth before calling tools."
-        )
+    # Log all headers once so we can see what Horizon injects
+    log.info(f"Incoming headers: {dict(headers)}")
 
-    # Log what's available so we can see it in Horizon Logs
-    log.info(f"Token client_id: {token.client_id}")
-    log.info(f"Token claims: {token.claims}")
-
-    # Try each field in order
+    # Try common identity header names in order of likelihood
     user_id = (
-        token.claims.get("id")       # GitHub numeric ID  e.g. 8675309
-        or token.claims.get("login") # GitHub username    e.g. "Sidhant22"
-        or token.client_id           # OAuth client ID
+        headers.get("x-user-id")
+        or headers.get("x-forwarded-user")
+        or headers.get("x-auth-user")
+        or headers.get("x-authenticated-user")
+        or headers.get("x-prefect-user-id")
     )
 
-    if not user_id:
-        log.error(f"Could not extract user_id from token. claims={token.claims}")
-        raise RuntimeError("Could not determine user identity from token.")
+    if user_id:
+        log.info(f"Identified user: {user_id}")
+        return user_id
 
-    return str(user_id)
+    # If no identity header found yet, log all headers at WARNING level
+    # so it's easy to spot in Horizon's Logs tab
+    log.warning(f"No user identity header found. All headers: {dict(headers)}")
+    return "anonymous"
 
 
 # ---------------------------------------------------------------------------
-# DB INITIALISATION  — sync, runs at module load
+# DB INITIALISATION — sync, runs at module load
 # ---------------------------------------------------------------------------
 
 def init_db():
@@ -90,7 +86,7 @@ def init_db():
         c.execute('''
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     TEXT    NOT NULL,
+                user_id     TEXT    NOT NULL DEFAULT 'anonymous',
                 date        TEXT    NOT NULL,
                 category    TEXT    DEFAULT '',
                 subcategory TEXT    DEFAULT '',
@@ -101,7 +97,7 @@ def init_db():
         c.execute('''
             CREATE TABLE IF NOT EXISTS income (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT    NOT NULL,
+                user_id TEXT    NOT NULL DEFAULT 'anonymous',
                 date    TEXT    NOT NULL,
                 source  TEXT    DEFAULT '',
                 amount  REAL    NOT NULL,
@@ -141,7 +137,7 @@ async def add_expense(
         return {"status": "error", "message": "amount must be a positive number"}
 
     user_id = get_current_user_id()
-    log.info(f"add_expense called by user_id={user_id} date={date} amount={amount}")
+    log.info(f"add_expense: user={user_id} date={date} amount={amount} category={category}")
 
     async with aiosqlite.connect(DB_PATH) as c:
         cur = await c.execute(
@@ -150,7 +146,6 @@ async def add_expense(
             (user_id, date, category.lower(), subcategory.lower(), amount, note)
         )
         await c.commit()
-        log.info(f"Expense inserted with id={cur.lastrowid}")
         return {"status": "success", "id": cur.lastrowid}
 
 
@@ -165,7 +160,7 @@ async def edit_expense(
 ) -> dict:
     """
     Update one or more fields of an existing expense.
-    Only edits expenses that belong to the authenticated user.
+    Only edits expenses that belong to the current user.
 
     Args:
         id:          ID of the expense to edit.
@@ -210,7 +205,7 @@ async def delete_expense(
     category: str = None
 ) -> dict:
     """
-    Delete expense entries. Only deletes expenses owned by the authenticated user.
+    Delete expense entries. Only deletes expenses owned by the current user.
 
     Two modes:
       • Single delete — provide id.
@@ -252,7 +247,7 @@ async def list_expenses(
     category: str = None
 ) -> list:
     """
-    Retrieve the authenticated user's expenses within a date range.
+    Retrieve the current user's expenses within a date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
@@ -288,7 +283,7 @@ async def summarize_expenses(
     category: str = None
 ) -> list:
     """
-    Summarise the authenticated user's spending by category (or subcategory).
+    Summarise the current user's spending by category (or subcategory).
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
@@ -329,7 +324,7 @@ async def add_income(
     note: str = ''
 ) -> dict:
     """
-    Record a credit / income entry for the authenticated user.
+    Record a credit / income entry for the current user.
 
     Args:
         date:   Date in YYYY-MM-DD format.
@@ -353,7 +348,7 @@ async def add_income(
 @mcp.tool()
 async def list_income(start_date: str, end_date: str) -> list:
     """
-    Retrieve the authenticated user's income entries within a date range.
+    Retrieve the current user's income entries within a date range.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
@@ -383,7 +378,7 @@ async def get_budget_summary(
     budgets: dict
 ) -> dict:
     """
-    Compare the authenticated user's actual spending against a budget.
+    Compare the current user's actual spending against a budget.
 
     Args:
         start_date: Start date (YYYY-MM-DD), inclusive.
